@@ -18,9 +18,9 @@ import pandas as pd
 
 
 # ── Tuneable parameters ────────────────────────────────────────────────────────
-IV_CAP            = 0.35    # reject if IV > 35%  (data: >40% IV strongly negative, 20-40% barely positive)
-ADX_MIN           = 18.0    # require trend strength ADX >= 18 (slight loosening to avoid data-sparse periods)
-SCORE_THRESHOLD   = 35      # minimum |score| to enter (slightly above 30 = eliminates weakest signals)
+IV_CAP            = 0.35    # reject if IV > 35%  (key insight: >35% IV = negative avg return)
+ADX_MIN           = 15.0    # loose trend filter — only skip extremely flat/ranging markets
+SCORE_THRESHOLD   = 30      # same as original; IV cap is the real quality gate
 CONFLUENCE_MIN    = 3       # minimum indicators agreeing (only used if explicitly called)
 
 
@@ -235,11 +235,9 @@ def apply_all_filters(
     Stops at first rejection.
     """
     checks = [
-        score_threshold_filter(score),
-        iv_cap_filter(sigma),
-        adx_filter(adx_val),
-        regime_direction_filter(regime, direction),
-        multi_tf_ema_filter(row, weekly_close, direction),
+        iv_cap_filter(sigma),          # PRIMARY: IV > 35% = negative expected return (data-proven)
+        adx_filter(adx_val),           # Skip extremely flat/ranging markets
+        regime_direction_filter(regime, direction),  # Don't fight strong macro trend
     ]
 
     rejections = []
