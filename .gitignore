@@ -1,0 +1,8 @@
+# Data and checkpoints (large binary files)
+data/
+backtest_checkpoints/
+backtest_results.json
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
