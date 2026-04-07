@@ -6,19 +6,23 @@ Strategy:
   - Iterate bars only to manage open/close trade state
   - When BUY CALL fires: buy a 30-DTE ATM call at Black-Scholes price
   - When BUY PUT fires:  buy a 30-DTE ATM put  at Black-Scholes price
-  - Exit rules (first to hit):
-      * Take Profit : +100% of entry premium
-      * Stop Loss   : -50%  of entry premium
-      * Time Stop   : 5 DTE remaining
 
-Signal output format:
-  BUY CALL | AAPL | 2023-04-15 | Stock @ $165.20 | Strike $165 | Entry $4.35/share ($435/contract) | IV 28.4% | Expiry 2023-05-15
-  SELL CALL | AAPL | 2023-05-10 | Stock @ $172.40 | Strike $165 | Exit $8.90/share ($890/contract) | P&L +$455 (+104.6%) | Take Profit
+Exit rules (ATR-based stock price targets):
+  - CALL Take Profit : stock rises 2.0 x ATR above entry price
+  - CALL Stop Loss   : stock falls 1.0 x ATR below entry price
+  - PUT  Take Profit : stock falls 2.0 x ATR below entry price
+  - PUT  Stop Loss   : stock rises 1.0 x ATR above entry price
+  - Hard floor       : option loses > 80% of premium → exit (decay protection)
+  - Time Stop        : 5 DTE remaining → exit at market
+
+Signal format:
+  BUY CALL | AAPL | 2024-04-15 | Stock @ $165.20 | Strike $165 | Entry $4.35/share ($435/contract) | IV 28.4%
+  SELL CALL | AAPL | 2024-05-10 | Stock @ $172.40 | Strike $165 | Exit $8.90/share ($890/contract) | P&L +$455 (+104.6%) | Take Profit (ATR)
 """
 
 from __future__ import annotations
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -29,25 +33,22 @@ import signal_filters as filters
 warnings.filterwarnings("ignore")
 
 # ── Strategy parameters ────────────────────────────────────────────────────────
-WARMUP_BARS   = 55      # bars needed to prime all indicators (EMA50 needs 50)
-OPTION_DTE    = 30      # days to expiry when opening a trade
-TIME_STOP_DTE = 5       # close when this many DTE remain
-TAKE_PROFIT   = 1.00    # +100% of entry premium
-STOP_LOSS     = -0.50   # -50% of entry premium
-MIN_PREMIUM   = 0.05    # skip signals where option would cost < $0.05
-CONTRACTS     = 1       # 1 contract = 100 shares
+WARMUP_BARS    = 55     # bars to prime indicators (EMA50 needs 50)
+OPTION_DTE     = 30     # days to expiry at entry
+TIME_STOP_DTE  = 5      # close when only N DTE remain
+HARD_STOP_PCT  = -0.80  # exit if option loses 80% of entry value (decay floor)
+ATR_TP_MULT    = 2.0    # take profit when stock moves this many ATR in our favor
+ATR_SL_MULT    = 1.0    # stop loss when stock moves this many ATR against us
+MIN_PREMIUM    = 0.05   # skip if option < $0.05
+CONTRACTS      = 1      # 1 contract = 100 shares
 
-# Set to True to apply accuracy filters; False for raw unfiltered signals
-USE_FILTERS   = True
+USE_FILTERS    = True   # set False to disable all accuracy filters
 
 
 # ── Vectorized indicator computation ──────────────────────────────────────────
 
 def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute all TA indicators on the full DataFrame in one pass.
-    Returns original df with extra indicator columns appended.
-    """
+    """Compute all TA indicators in one vectorized pass. Returns df + columns."""
     close = df["Close"].astype(float)
     high  = df["High"].astype(float)
     low   = df["Low"].astype(float)
@@ -55,119 +56,106 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     out = df.copy()
 
-    # RSI
-    delta = close.diff()
-    gain  = delta.clip(lower=0).ewm(com=13, min_periods=14).mean()
-    loss  = (-delta.clip(upper=0)).ewm(com=13, min_periods=14).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    out["rsi"] = 100 - (100 / (1 + rs))
+    # RSI(14)
+    delta    = close.diff()
+    gain     = delta.clip(lower=0).ewm(com=13, min_periods=14).mean()
+    loss     = (-delta.clip(upper=0)).ewm(com=13, min_periods=14).mean()
+    out["rsi"] = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
 
-    # MACD
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    macd  = ema12 - ema26
-    sig   = macd.ewm(span=9, adjust=False).mean()
+    # MACD(12,26,9)
+    ema12          = close.ewm(span=12, adjust=False).mean()
+    ema26          = close.ewm(span=26, adjust=False).mean()
+    macd           = ema12 - ema26
+    sig            = macd.ewm(span=9, adjust=False).mean()
     out["macd_hist"]     = macd - sig
     out["macd_hist_lag"] = out["macd_hist"].shift(1)
 
-    # Bollinger Bands %B
-    sma20 = close.rolling(20).mean()
-    std20 = close.rolling(20).std()
-    upper = sma20 + 2 * std20
-    lower = sma20 - 2 * std20
-    band_range = (upper - lower).replace(0, np.nan)
-    out["bb_pct_b"] = (close - lower) / band_range
+    # Bollinger Bands %B (20, 2)
+    sma20      = close.rolling(20).mean()
+    std20      = close.rolling(20).std()
+    bb_upper   = sma20 + 2 * std20
+    bb_lower   = sma20 - 2 * std20
+    out["bb_pct_b"] = (close - bb_lower) / (bb_upper - bb_lower).replace(0, np.nan)
 
     # EMAs
     out["ema20"] = close.ewm(span=20, adjust=False).mean()
     out["ema50"] = close.ewm(span=50, adjust=False).mean()
 
-    # Historical volatility (20-day rolling, annualized)
-    log_ret = np.log(close / close.shift(1))
-    out["hv20"] = log_ret.rolling(20).std() * np.sqrt(252)
-    out["hv20"] = out["hv20"].clip(lower=0.05, upper=3.0)
+    # Historical volatility — 20-day rolling annualized
+    log_ret    = np.log(close / close.shift(1))
+    out["hv20"] = (log_ret.rolling(20).std() * np.sqrt(252)).clip(lower=0.05, upper=3.0)
 
-    # Volume ratio
-    vol_avg = vol.rolling(20).mean().replace(0, np.nan)
+    # Volume ratio vs 20-day average
+    vol_avg         = vol.rolling(20).mean().replace(0, np.nan)
     out["vol_ratio"] = vol / vol_avg
 
-    # ADX (vectorized)
-    up_move   = high.diff()
-    down_move = -low.diff()
-    plus_dm_v  = np.where((up_move > down_move) & (up_move > 0),   up_move,   0.0)
-    minus_dm_v = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    # ATR(14) — raw dollar value for exit targeting
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    out["atr_val"] = tr.ewm(com=13, min_periods=14).mean()
+    out["atr_pct"] = out["atr_val"] / close.replace(0, np.nan)
 
-    prev_close2 = close.shift(1)
-    tr2 = pd.concat([high - low, (high - prev_close2).abs(), (low - prev_close2).abs()], axis=1).max(axis=1)
-    atr14 = tr2.ewm(com=13, min_periods=14).mean()
-    pdm   = pd.Series(plus_dm_v,  index=df.index).ewm(com=13, min_periods=14).mean()
-    mdm   = pd.Series(minus_dm_v, index=df.index).ewm(com=13, min_periods=14).mean()
-    pdi   = 100 * pdm  / atr14.replace(0, np.nan)
-    mdi   = 100 * mdm  / atr14.replace(0, np.nan)
-    dx    = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    # ADX(14) — vectorized
+    up_move    = high.diff()
+    down_move  = -low.diff()
+    plus_dm    = np.where((up_move > down_move) & (up_move > 0),   up_move,   0.0)
+    minus_dm   = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    atr14      = tr.ewm(com=13, min_periods=14).mean()
+    pdm        = pd.Series(plus_dm,  index=df.index).ewm(com=13, min_periods=14).mean()
+    mdm        = pd.Series(minus_dm, index=df.index).ewm(com=13, min_periods=14).mean()
+    pdi        = 100 * pdm / atr14.replace(0, np.nan)
+    mdi        = 100 * mdm / atr14.replace(0, np.nan)
+    dx         = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
     out["adx"] = dx.ewm(com=13, min_periods=14).mean()
 
     return out
 
 
+# ── Directional score ─────────────────────────────────────────────────────────
+
 def _score_row(row) -> int:
-    """
-    Compute directional score for a single precomputed indicator row.
-    Mirrors signal_engine.score_direction() logic but on precomputed values.
-    Returns int in [-100, +100].
-    """
+    """Score a single precomputed indicator row. Returns int in [-100, +100]."""
     score = 0
-    rsi = row["rsi"]
+    rsi   = row["rsi"]
     if pd.isna(rsi):
         return 0
 
     # RSI
-    if rsi < 30:
-        score += 25
-    elif rsi < 45:
-        score += 10
-    elif rsi > 70:
-        score -= 25
-    elif rsi > 55:
-        score -= 10
+    if   rsi < 30:  score += 25
+    elif rsi < 45:  score += 10
+    elif rsi > 70:  score -= 25
+    elif rsi > 55:  score -= 10
 
-    # MACD
+    # MACD histogram
     hist     = row["macd_hist"]
     hist_lag = row["macd_hist_lag"]
-    if pd.isna(hist) or pd.isna(hist_lag):
-        pass
-    elif hist > 0 and hist_lag <= 0:
-        score += 20   # bullish crossover
-    elif hist < 0 and hist_lag >= 0:
-        score -= 20   # bearish crossover
-    elif hist > 0:
-        score += 10
-    else:
-        score -= 10
+    if not (pd.isna(hist) or pd.isna(hist_lag)):
+        if   hist > 0 and hist_lag <= 0: score += 20  # bullish crossover
+        elif hist < 0 and hist_lag >= 0: score -= 20  # bearish crossover
+        elif hist > 0:                   score += 10
+        else:                            score -= 10
 
     # Bollinger %B
     pct_b = row["bb_pct_b"]
     if not pd.isna(pct_b):
-        if pct_b < 0.10:
-            score += 20
-        elif pct_b > 0.90:
-            score -= 20
+        if   pct_b < 0.10: score += 20
+        elif pct_b > 0.90: score -= 20
 
     # EMA trend
     ema20 = row["ema20"]
     ema50 = row["ema50"]
     price = row["Close"]
     if not (pd.isna(ema20) or pd.isna(ema50)):
-        if price > ema20 and ema20 > ema50:
-            score += 15
-        elif price < ema20 and ema20 < ema50:
-            score -= 15
-        elif price > ema20:
-            score += 5
-        else:
-            score -= 5
+        if   price > ema20 and ema20 > ema50: score += 15
+        elif price < ema20 and ema20 < ema50: score -= 15
+        elif price > ema20:                   score += 5
+        else:                                 score -= 5
 
-    # Volume
+    # Volume amplifier
     vr = row["vol_ratio"]
     if not pd.isna(vr) and vr > 1.5:
         score = int(score * 1.15)
@@ -179,19 +167,23 @@ def _score_row(row) -> int:
 
 @dataclass
 class Trade:
-    trade_id:      int
-    ticker:        str
-    direction:     str
-    entry_date:    object
-    entry_stock:   float
-    strike:        float
-    expiry_date:   object
-    entry_premium: float
-    entry_sigma:   float
-    exit_date:     object = None
-    exit_stock:    float  = None
-    exit_premium:  float  = None
-    exit_reason:   str    = None
+    trade_id:         int
+    ticker:           str
+    direction:        str
+    entry_date:       object
+    entry_stock:      float
+    strike:           float
+    expiry_date:      object
+    entry_premium:    float
+    entry_sigma:      float
+    entry_atr:        float = 0.0
+    tp_stock:         float = 0.0   # ATR-based take profit stock price
+    sl_stock:         float = 0.0   # ATR-based stop loss stock price
+    entry_indicators: dict  = field(default_factory=dict)
+    exit_date:        object = None
+    exit_stock:       float  = None
+    exit_premium:     float  = None
+    exit_reason:      str    = None
 
     @property
     def pnl_per_share(self):
@@ -206,7 +198,7 @@ class Trade:
 
     @property
     def pnl_pct(self):
-        if self.entry_premium == 0 or self.pnl_per_share is None:
+        if not self.entry_premium or self.pnl_per_share is None:
             return None
         return (self.pnl_per_share / self.entry_premium) * 100
 
@@ -219,7 +211,7 @@ class Trade:
             f"BUY {self.direction:<4} | {self.ticker:<6} | {str(self.entry_date)[:10]} | "
             f"Stock @ ${self.entry_stock:>9.2f} | Strike ${self.strike:.2f} | "
             f"Entry ${self.entry_premium:.2f}/share (${self.entry_premium*100:.0f}/contract) | "
-            f"IV {self.entry_sigma*100:.1f}% | Expiry {str(self.expiry_date)[:10]}"
+            f"IV {self.entry_sigma*100:.1f}% | ATR ${self.entry_atr:.2f} | Expiry {str(self.expiry_date)[:10]}"
         )
 
     def exit_line(self) -> str:
@@ -238,15 +230,17 @@ class Trade:
 # ── Main backtest loop ─────────────────────────────────────────────────────────
 
 def backtest_ticker(
-    ticker:       str,
-    df:           pd.DataFrame,
-    market_regime: str             = "neutral",
-    weekly_close:  pd.Series | None = None,
+    ticker:           str,
+    df:               pd.DataFrame,
+    market_regime:    str              = "neutral",
+    weekly_close:     pd.Series | None = None,
+    earnings_dates:   set              = None,
+    sector_regime_fn                   = None,   # callable(ticker, date) -> str
+    ml_model                           = None,
 ) -> list[Trade]:
     """
-    Vectorized backtest for a single ticker.
-    Precomputes all indicators, then iterates bars only for trade state.
-    Applies accuracy filters when USE_FILTERS = True.
+    Vectorized options backtest for a single ticker.
+    All filters and ATR-based exits are applied when USE_FILTERS=True.
     """
     if len(df) < WARMUP_BARS + 10:
         return []
@@ -260,29 +254,45 @@ def backtest_ticker(
 
     for i, (ts, row) in enumerate(rows.iterrows()):
         price = float(row["Close"])
-        # Skip pre-reverse-split bars on leveraged/vol ETFs (absurdly high prices)
         if price <= 0 or pd.isna(price) or price > 50_000:
             continue
 
         # ── Manage open trade ────────────────────────────────────────────────
         if open_trade is not None:
             dte = max(0, (pd.Timestamp(open_trade.expiry_date) - ts).days)
-            sigma = float(row["hv20"]) if not pd.isna(row["hv20"]) else open_trade.entry_sigma
+            sigma = float(row["hv20"]) if not pd.isna(row.get("hv20", np.nan)) else open_trade.entry_sigma
             sigma = max(0.05, min(sigma, 3.0))
 
+            # Price option at current stock price
             cur_prem = pricer.price_option(
                 open_trade.direction, price, open_trade.strike, dte, sigma
             )
             pnl_pct = (cur_prem - open_trade.entry_premium) / open_trade.entry_premium
 
             exit_reason = None
-            if pnl_pct >= TAKE_PROFIT:
-                exit_reason = "Take Profit"
-            elif pnl_pct <= STOP_LOSS:
-                exit_reason = "Stop Loss"
-            elif dte <= TIME_STOP_DTE:
+
+            # ATR-based stock price exits (primary)
+            if open_trade.direction == "CALL":
+                if price >= open_trade.tp_stock:
+                    exit_reason = "Take Profit (ATR)"
+                elif price <= open_trade.sl_stock:
+                    exit_reason = "Stop Loss (ATR)"
+            else:  # PUT
+                if price <= open_trade.tp_stock:
+                    exit_reason = "Take Profit (ATR)"
+                elif price >= open_trade.sl_stock:
+                    exit_reason = "Stop Loss (ATR)"
+
+            # Hard floor: option lost 80% of value (decay / wrong direction)
+            if exit_reason is None and pnl_pct <= HARD_STOP_PCT:
+                exit_reason = "Hard Stop (80% loss)"
+
+            # Time stop
+            if exit_reason is None and dte <= TIME_STOP_DTE:
                 exit_reason = "Time Stop (5 DTE)"
-            elif i == len(rows) - 1:
+
+            # End of data
+            if exit_reason is None and i == len(rows) - 1:
                 exit_reason = "End of Data"
 
             if exit_reason:
@@ -300,32 +310,61 @@ def backtest_ticker(
             continue
 
         direction = "CALL" if score > 0 else "PUT"
-        sigma = float(row["hv20"]) if not pd.isna(row["hv20"]) else 0.30
+        sigma = float(row["hv20"]) if not pd.isna(row.get("hv20", np.nan)) else 0.30
         sigma = max(0.05, min(sigma, 3.0))
+        atr   = float(row["atr_val"]) if not pd.isna(row.get("atr_val", np.nan)) else price * 0.02
+        atr   = max(atr, price * 0.005)   # floor at 0.5% of price
+
+        # Build entry indicators dict (for ML and checkpoint storage)
+        entry_ind = {
+            "rsi":       float(row.get("rsi",       50)),
+            "macd_hist": float(row.get("macd_hist",  0)),
+            "bb_pct_b":  float(row.get("bb_pct_b",  0.5)),
+            "ema20":     float(row.get("ema20",  price)),
+            "ema50":     float(row.get("ema50",  price)),
+            "hv20":      sigma,
+            "adx":       float(row.get("adx",       20)),
+            "vol_ratio": float(row.get("vol_ratio",  1)),
+            "atr_pct":   atr / price if price > 0 else 0.02,
+        }
 
         # ── Apply accuracy filters ───────────────────────────────────────────
         if USE_FILTERS:
-            adx_val = float(row["adx"]) if not pd.isna(row.get("adx", np.nan)) else 25.0
+            adx_val = float(row.get("adx", 25) or 25)
 
-            # Build weekly close up to current date for multi-TF check
-            wk_close = None
-            if weekly_close is not None:
-                wk_close = weekly_close[weekly_close.index <= ts]
+            # Sector regime at this date
+            sector_reg = "neutral"
+            if sector_regime_fn is not None:
+                try:
+                    sector_reg = sector_regime_fn(ticker, ts)
+                except Exception:
+                    pass
 
             passed, _ = filters.apply_all_filters(
-                score        = score,
-                direction    = direction,
-                sigma        = sigma,
-                adx_val      = adx_val,
-                row          = row,
-                regime       = market_regime,
-                weekly_close = wk_close,
+                score          = score,
+                direction      = direction,
+                sigma          = sigma,
+                adx_val        = adx_val,
+                row            = row,
+                regime         = market_regime,
+                earnings_dates = earnings_dates or set(),
+                sector_regime  = sector_reg,
+                ml_model       = ml_model,
+                entry_features = entry_ind,
             )
             if not passed:
                 continue
 
-        strike = pricer.atm_strike(price)
-        expiry = (ts + pd.Timedelta(days=OPTION_DTE)).date()
+        # ── Compute ATR-based stock price targets ────────────────────────────
+        if direction == "CALL":
+            tp_stock = price + ATR_TP_MULT * atr
+            sl_stock = price - ATR_SL_MULT * atr
+        else:
+            tp_stock = price - ATR_TP_MULT * atr
+            sl_stock = price + ATR_SL_MULT * atr
+
+        strike  = pricer.atm_strike(price)
+        expiry  = (ts + pd.Timedelta(days=OPTION_DTE)).date()
         premium = pricer.price_option(direction, price, strike, OPTION_DTE, sigma)
 
         if premium < MIN_PREMIUM or strike <= 0:
@@ -333,15 +372,19 @@ def backtest_ticker(
 
         trade_id += 1
         open_trade = Trade(
-            trade_id      = trade_id,
-            ticker        = ticker,
-            direction     = direction,
-            entry_date    = ts.date(),
-            entry_stock   = round(price, 4),
-            strike        = strike,
-            expiry_date   = expiry,
-            entry_premium = round(premium, 4),
-            entry_sigma   = round(sigma, 4),
+            trade_id         = trade_id,
+            ticker           = ticker,
+            direction        = direction,
+            entry_date       = ts.date(),
+            entry_stock      = round(price, 4),
+            strike           = strike,
+            expiry_date      = expiry,
+            entry_premium    = round(premium, 4),
+            entry_sigma      = round(sigma, 4),
+            entry_atr        = round(atr, 4),
+            tp_stock         = round(tp_stock, 4),
+            sl_stock         = round(sl_stock, 4),
+            entry_indicators = entry_ind,
         )
 
     return trades
@@ -363,8 +406,8 @@ def compute_stats(trades: list[Trade]) -> dict:
     avg_win  = float(np.mean([t.pnl_dollars for t in wins]))   if wins   else 0.0
     avg_loss = float(np.mean([t.pnl_dollars for t in losses])) if losses else 0.0
 
-    cum = np.cumsum(pnls)
-    peak = np.maximum.accumulate(cum)
+    cum    = np.cumsum(pnls)
+    peak   = np.maximum.accumulate(cum)
     max_dd = float(np.min(cum - peak))
 
     loss_total = sum(t.pnl_dollars for t in losses)

@@ -1,61 +1,71 @@
 """
-Options backtesting system — with checkpoint/resume support.
+Options backtesting system — checkpoint/resume + all accuracy filters.
 
-If the run is interrupted, simply re-run the same command and it will
-skip already-completed tickers and continue from where it left off.
+Improvements over baseline:
+  1. Dynamic ATR-based exits (2x ATR take profit, 1x ATR stop loss)
+  2. Earnings filter (skip within 5 days of earnings)
+  3. Sector ETF alignment (trade in direction of sector trend)
+  4. ML filter (GradientBoosting win probability prediction)
+
+Workflow:
+  First run  : python run_backtest.py --no-download
+  Train ML   : python ml_signal.py --train
+  Second run : python run_backtest.py --no-download   (now uses ML filter too)
 
 Usage:
-    python run_backtest.py                   # download + run full backtest
-    python run_backtest.py --no-download     # skip download, use cached data
-    python run_backtest.py --ticker AAPL     # run only for one ticker
-    python run_backtest.py --log             # show full trade log after summary
-    python run_backtest.py --best-worst      # show best/worst individual trades
-    python run_backtest.py --reset           # clear checkpoints and start over
+    python run_backtest.py                    # download + full backtest
+    python run_backtest.py --no-download      # use cached data
+    python run_backtest.py --ticker AAPL      # single ticker
+    python run_backtest.py --log              # show full trade log
+    python run_backtest.py --best-worst       # show best/worst trades
+    python run_backtest.py --reset            # clear checkpoints, start over
 """
 
 import argparse
 import json
 import pickle
+import time
 import warnings
 from pathlib import Path
 
+import pandas as pd
+import yfinance as yf
 from rich.console import Console
-from rich.progress import (
-    Progress, BarColumn,
-    TextColumn, TimeElapsedColumn, MofNCompleteColumn,
-)
+from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, MofNCompleteColumn
 
 import data_downloader
 import backtester
 import backtest_report
+import signal_filters as sf
+import ml_signal
 from tickers import TICKERS
 
 warnings.filterwarnings("ignore")
 
 console = Console()
 
-RESULTS_FILE    = Path("backtest_results.json")
-CHECKPOINT_DIR  = Path("backtest_checkpoints")
+RESULTS_FILE      = Path("backtest_results.json")
+CHECKPOINT_DIR    = Path("backtest_checkpoints")
+EARNINGS_CACHE    = Path("data/earnings_dates.json")
+SECTOR_CACHE      = Path("data/sector_regimes.pkl")
+
 CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 
 # ── Checkpoint helpers ─────────────────────────────────────────────────────────
 
-def _checkpoint_path(ticker: str) -> Path:
-    return CHECKPOINT_DIR / f"{ticker}.pkl"
-
-
 def _save_checkpoint(ticker: str, trades: list, stats: dict) -> None:
-    with open(_checkpoint_path(ticker), "wb") as f:
+    path = CHECKPOINT_DIR / f"{ticker}.pkl"
+    with open(path, "wb") as f:
         pickle.dump({"trades": trades, "stats": stats}, f)
 
 
 def _load_checkpoint(ticker: str):
-    p = _checkpoint_path(ticker)
-    if not p.exists():
+    path = CHECKPOINT_DIR / f"{ticker}.pkl"
+    if not path.exists():
         return None
     try:
-        with open(p, "rb") as f:
+        with open(path, "rb") as f:
             return pickle.load(f)
     except Exception:
         return None
@@ -71,27 +81,126 @@ def _reset_checkpoints() -> None:
     console.print("[yellow]Checkpoints cleared. Starting fresh.[/yellow]\n")
 
 
+# ── Earnings dates ─────────────────────────────────────────────────────────────
+
+def _download_earnings_dates(tickers: list[str]) -> dict[str, list[str]]:
+    """Download and cache earnings dates for all tickers."""
+    console.print("[cyan]Downloading earnings dates (cached after first run)...[/cyan]")
+    result: dict[str, list[str]] = {}
+    for ticker in tickers:
+        try:
+            stock = yf.Ticker(ticker)
+            df = stock.earnings_dates
+            if df is not None and not df.empty:
+                dates = [str(d.date()) for d in df.index if not pd.isna(d)]
+                result[ticker] = dates
+            else:
+                result[ticker] = []
+            time.sleep(0.1)
+        except Exception:
+            result[ticker] = []
+    return result
+
+
+def load_earnings_dates(tickers: list[str]) -> dict[str, set]:
+    """Returns {ticker: set_of_date_objects}."""
+    import datetime
+
+    if EARNINGS_CACHE.exists():
+        try:
+            with open(EARNINGS_CACHE) as f:
+                raw = json.load(f)
+        except Exception:
+            raw = {}
+    else:
+        raw = _download_earnings_dates(tickers)
+        EARNINGS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        with open(EARNINGS_CACHE, "w") as f:
+            json.dump(raw, f)
+
+    # Convert to sets of date objects
+    result = {}
+    for ticker, date_strs in raw.items():
+        dates = set()
+        for ds in date_strs:
+            try:
+                dates.add(datetime.date.fromisoformat(str(ds)[:10]))
+            except Exception:
+                pass
+        result[ticker] = dates
+    return result
+
+
+# ── Sector regime precomputation ───────────────────────────────────────────────
+
+def build_sector_regimes() -> dict[str, pd.Series]:
+    """
+    For each unique sector ETF in SECTOR_ETF_MAP, load its daily data
+    and compute a date-indexed Series of 'bull'/'bear'/'neutral'.
+    Returns {etf_ticker: pd.Series}.
+    """
+    if SECTOR_CACHE.exists():
+        try:
+            with open(SECTOR_CACHE, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            pass
+
+    unique_etfs = set(sf.SECTOR_ETF_MAP.values())
+    console.print(f"[cyan]Computing sector regimes for {len(unique_etfs)} ETFs...[/cyan]")
+
+    regimes: dict[str, pd.Series] = {}
+    for etf in sorted(unique_etfs):
+        df = data_downloader.load_daily(etf)
+        if df is not None and len(df) >= 55:
+            regimes[etf] = sf.compute_sector_regimes(df)
+        else:
+            regimes[etf] = pd.Series(dtype=str)
+
+    with open(SECTOR_CACHE, "wb") as f:
+        pickle.dump(regimes, f)
+    return regimes
+
+
+def make_sector_regime_fn(regimes: dict[str, pd.Series]):
+    """Returns a function: (ticker, date) -> 'bull'/'bear'/'neutral'."""
+    def get_regime(ticker: str, date: pd.Timestamp) -> str:
+        etf = sf.SECTOR_ETF_MAP.get(ticker.upper())
+        if etf is None:
+            return "neutral"
+        series = regimes.get(etf)
+        if series is None or series.empty:
+            return "neutral"
+        # Normalize timezone
+        try:
+            idx = series.index
+            if idx.tz is not None:
+                idx = idx.tz_localize(None)
+                series = pd.Series(series.values, index=idx)
+            past = series[idx <= date]
+            return past.iloc[-1] if not past.empty else "neutral"
+        except Exception:
+            return "neutral"
+    return get_regime
+
+
 # ── Main run ───────────────────────────────────────────────────────────────────
 
 def run(args):
     if args.reset:
         _reset_checkpoints()
 
-    # ── Step 1: Download / locate data ──────────────────────────────────────
+    # ── Step 1: Data ────────────────────────────────────────────────────────
     disk_mb = data_downloader._disk_mb()
 
     if args.no_download or (disk_mb > 10 and not args.force_download):
-        console.print(f"[dim]Using cached data ({disk_mb:.0f} MB on disk). "
-                      f"Pass --force-download to refresh.[/dim]\n")
+        console.print(f"[dim]Using cached data ({disk_mb:.0f} MB). Pass --force-download to refresh.[/dim]\n")
         ticker_list = data_downloader.available_tickers()
     else:
-        download_stats = data_downloader.download_all(TICKERS, size_limit_gb=1.8)
+        stats = data_downloader.download_all(TICKERS, size_limit_gb=1.8)
         console.print(
-            f"\n[green]Download complete:[/green] "
-            f"{download_stats['tickers_ok']} tickers, "
-            f"{download_stats['total_daily_bars']:,} daily bars, "
-            f"{download_stats['total_hourly_bars']:,} hourly bars, "
-            f"{download_stats['disk_mb']:.0f} MB on disk\n"
+            f"\n[green]Download complete:[/green] {stats['tickers_ok']} tickers, "
+            f"{stats['total_daily_bars']:,} daily bars, {stats['disk_mb']:.0f} MB\n"
         )
         ticker_list = data_downloader.available_tickers()
 
@@ -102,25 +211,43 @@ def run(args):
         console.print("[red]No data found. Run without --no-download first.[/red]")
         return
 
-    # ── Step 2: Compute market regime from SPY (used for all tickers) ──────────
-    import signal_filters as sf
+    # ── Step 2: Market regime (SPY) ─────────────────────────────────────────
     spy_df = data_downloader.load_daily("SPY")
     market_regime = sf.compute_market_regime(spy_df)
-    console.print(f"[dim]Market regime (SPY): [bold]{market_regime.upper()}[/bold][/dim]\n")
+    console.print(f"[dim]Market regime (SPY): [bold]{market_regime.upper()}[/bold][/dim]")
 
-    # ── Step 3: Identify already-done tickers ────────────────────────────────
-    done = _completed_tickers()
+    # ── Step 3: Sector regimes ───────────────────────────────────────────────
+    sector_regimes  = build_sector_regimes()
+    sector_regime_fn = make_sector_regime_fn(sector_regimes)
+
+    # ── Step 4: Earnings dates ───────────────────────────────────────────────
+    earnings_map = load_earnings_dates(ticker_list)
+    console.print(
+        f"[dim]Earnings dates loaded for {sum(1 for v in earnings_map.values() if v)} tickers.[/dim]\n"
+    )
+
+    # ── Step 5: ML model ─────────────────────────────────────────────────────
+    model = ml_signal.load_model()
+    if model:
+        console.print("[dim]ML model loaded — applying win probability filter.[/dim]\n")
+    else:
+        console.print(
+            "[dim]No ML model found. Run 'python ml_signal.py --train' after first backtest "
+            "to enable the ML filter.[/dim]\n"
+        )
+
+    # ── Step 6: Backtest remaining tickers ───────────────────────────────────
+    done      = _completed_tickers()
     remaining = [t for t in ticker_list if t not in done]
 
     if done and not args.ticker:
         console.print(
-            f"[dim]Resuming: {len(done)} tickers already done, "
-            f"{len(remaining)} remaining.[/dim]\n"
+            f"[dim]Resuming: {len(done)} done, {len(remaining)} remaining. "
+            f"Use --reset to start over.[/dim]\n"
         )
     else:
         console.print(f"[bold cyan]Running backtest on {len(ticker_list)} tickers...[/bold cyan]\n")
 
-    # ── Step 3: Backtest remaining tickers ───────────────────────────────────
     if remaining:
         with Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -140,7 +267,7 @@ def run(args):
                         progress.advance(task)
                         continue
 
-                    # Build weekly close for multi-TF filter
+                    # Weekly close for optional multi-TF
                     weekly_close = None
                     try:
                         weekly_close = df["Close"].resample("W").last().dropna()
@@ -148,25 +275,28 @@ def run(args):
                         pass
 
                     trades = backtester.backtest_ticker(
-                        ticker, df,
-                        market_regime=market_regime,
-                        weekly_close=weekly_close,
+                        ticker           = ticker,
+                        df               = df,
+                        market_regime    = market_regime,
+                        weekly_close     = weekly_close,
+                        earnings_dates   = earnings_map.get(ticker, set()),
+                        sector_regime_fn = sector_regime_fn,
+                        ml_model         = model,
                     )
-                    stats  = backtester.compute_stats(trades)
+                    stats = backtester.compute_stats(trades)
                     _save_checkpoint(ticker, trades, stats)
 
                 except KeyboardInterrupt:
                     console.print(
-                        "\n[yellow]Interrupted! Progress saved. "
-                        "Re-run to continue from here.[/yellow]"
+                        "\n[yellow]Interrupted — progress saved. Re-run to continue.[/yellow]"
                     )
                     return
-                except Exception as e:
+                except Exception:
                     _save_checkpoint(ticker, [], {})
 
                 progress.advance(task)
 
-    # ── Step 4: Load all checkpoints ─────────────────────────────────────────
+    # ── Step 7: Load all checkpoints ─────────────────────────────────────────
     all_trades: list = []
     all_stats:  dict = {}
 
@@ -178,41 +308,39 @@ def run(args):
         if ck["stats"]:
             all_stats[ticker] = ck["stats"]
 
-    completed_trades = [t for t in all_trades if t.exit_date is not None]
-    if not completed_trades:
-        console.print("[red]No completed trades found. Check your data.[/red]")
+    completed = [t for t in all_trades if t.exit_date is not None]
+    if not completed:
+        console.print("[red]No completed trades found.[/red]")
         return
 
-    # ── Step 5: Save consolidated JSON results ───────────────────────────────
-    results_data = {
-        "tickers_analyzed": len(all_stats),
-        "total_trades": len(completed_trades),
-        "disk_mb": data_downloader._disk_mb(),
-        "per_ticker": all_stats,
-    }
+    # ── Step 8: Save JSON results ─────────────────────────────────────────────
     with open(RESULTS_FILE, "w") as f:
-        json.dump(results_data, f, indent=2, default=str)
+        json.dump(
+            {"tickers_analyzed": len(all_stats), "total_trades": len(completed),
+             "disk_mb": disk_mb, "per_ticker": all_stats},
+            f, indent=2, default=str,
+        )
 
-    # ── Step 6: Display results ──────────────────────────────────────────────
+    # ── Step 9: Display ───────────────────────────────────────────────────────
     console.print()
-    backtest_report.print_overall_summary(all_stats, len(all_stats), data_downloader._disk_mb())
+    backtest_report.print_overall_summary(all_stats, len(all_stats), disk_mb)
     console.print()
     backtest_report.print_ticker_stats(all_stats)
     console.print()
     backtest_report.print_exit_breakdown(all_trades)
 
     if args.log:
-        ticker_filter = args.ticker.upper() if args.ticker else None
         backtest_report.print_trade_log(
-            all_trades, max_trades=100, filter_ticker=ticker_filter
+            all_trades, max_trades=100,
+            filter_ticker=args.ticker.upper() if args.ticker else None,
         )
 
     if args.best_worst:
         backtest_report.print_best_worst(all_trades, n=10)
 
-    # Always show a sample of recent trades
+    # Quick sample
     console.print("\n[bold]Sample Signals (10 most recent closed trades):[/bold]\n")
-    recent = sorted(completed_trades, key=lambda t: t.entry_date, reverse=True)[:10]
+    recent = sorted(completed, key=lambda t: t.entry_date, reverse=True)[:10]
     for t in recent:
         d_style = "green" if t.direction == "CALL" else "red"
         p_style = "green" if t.is_win else "red"
@@ -220,29 +348,25 @@ def run(args):
         console.print(f"  [{p_style}]{t.exit_line()}[/{p_style}]")
         console.print()
 
-    console.print(f"[dim]Full results saved to {RESULTS_FILE}[/dim]")
-    console.print(f"[dim]Checkpoints in {CHECKPOINT_DIR}/ — run with --reset to start over[/dim]")
+    console.print(f"[dim]Results: {RESULTS_FILE} | Checkpoints: {CHECKPOINT_DIR}/[/dim]")
+    if not model:
+        console.print(
+            "[bold yellow]Next step: python ml_signal.py --train  "
+            "then re-run to add ML filter.[/bold yellow]"
+        )
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        prog="run_backtest",
-        description="Options signal backtester with checkpoint/resume support",
-    )
-    parser.add_argument("--no-download",    action="store_true",
-                        help="Skip download, use cached data on disk")
-    parser.add_argument("--force-download", action="store_true",
-                        help="Re-download all tickers even if cached")
-    parser.add_argument("--ticker",  "-t",  type=str, default=None,
-                        help="Run for a single ticker only")
-    parser.add_argument("--log",            action="store_true",
-                        help="Print full trade log after summary")
-    parser.add_argument("--best-worst",     action="store_true",
-                        help="Show top 10 best and worst individual trades")
+    parser = argparse.ArgumentParser(description="Options signal backtester")
+    parser.add_argument("--no-download",    action="store_true")
+    parser.add_argument("--force-download", action="store_true")
+    parser.add_argument("--ticker",  "-t",  type=str, default=None)
+    parser.add_argument("--log",            action="store_true")
+    parser.add_argument("--best-worst",     action="store_true")
     parser.add_argument("--reset",          action="store_true",
-                        help="Clear all checkpoints and start the backtest over")
+                        help="Clear checkpoints and re-run everything")
     args = parser.parse_args()
     run(args)
 

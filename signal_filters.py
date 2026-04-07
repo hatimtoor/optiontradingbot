@@ -3,13 +3,12 @@ Accuracy filters applied BEFORE entering a trade.
 Each filter returns (pass: bool, reason: str).
 
 Filters implemented:
-  1. IV Cap          — skip options when IV is too high (premiums are expensive,
-                       mean-reversion favors sellers not buyers)
-  2. ADX Strength    — only trade when there is an established trend
-  3. Score Threshold — require a minimum directional conviction score
-  4. Confluence      — require a minimum number of indicators to agree
-  5. Market Regime   — use SPY / broad market health to filter direction
-  6. Multi-TF EMA    — daily trend must agree with weekly EMA direction
+  1. IV Cap            — skip when IV > 35% (high IV = expensive premiums, negative return)
+  2. ADX Strength      — skip extremely flat/ranging markets
+  3. Market Regime     — don't trade against SPY macro trend
+  4. Earnings Filter   — skip within 5 days of earnings (IV crush kills buyers)
+  5. Sector Alignment  — require sector ETF to agree with trade direction
+  6. ML Filter         — skip if GradientBoosting model predicts < 52% win chance
 """
 
 from __future__ import annotations
@@ -219,25 +218,158 @@ def multi_tf_ema_filter(
     return True, ""
 
 
+# ── 4. Earnings Filter ────────────────────────────────────────────────────────
+
+EARNINGS_WINDOW = 5   # days — skip signals this close to earnings
+
+def earnings_filter(
+    signal_date,
+    earnings_dates: set,
+) -> tuple[bool, str]:
+    """
+    Skip signals within EARNINGS_WINDOW days of a known earnings date.
+    Earnings events cause IV crush that destroys long option premium value.
+    earnings_dates: set of datetime.date objects for this ticker.
+    """
+    if not earnings_dates:
+        return True, ""
+
+    import datetime
+    if hasattr(signal_date, "date"):
+        signal_date = signal_date.date()
+
+    for ed in earnings_dates:
+        if hasattr(ed, "date"):
+            ed = ed.date()
+        try:
+            delta = abs((signal_date - ed).days)
+            if delta <= EARNINGS_WINDOW:
+                return False, f"Earnings within {delta} days ({ed}) - IV crush risk"
+        except Exception:
+            continue
+
+    return True, ""
+
+
+# ── 5. Sector ETF Alignment ────────────────────────────────────────────────────
+
+# Map each ticker to its primary sector ETF
+SECTOR_ETF_MAP: dict[str, str] = {
+    # Technology / Software / Semis
+    "AAPL": "XLK", "MSFT": "XLK", "NVDA": "XLK", "GOOGL": "XLK", "GOOG": "XLK",
+    "META": "XLK", "AMD":  "XLK", "INTC": "XLK", "QCOM":  "XLK", "MU":   "XLK",
+    "AMAT": "XLK", "LRCX": "XLK", "KLAC": "XLK", "TXN":   "XLK", "AVGO": "XLK",
+    "MRVL": "XLK", "SMCI": "XLK", "ARM":  "XLK", "TSM":   "XLK",
+    "ORCL": "XLK", "CRM":  "XLK", "ADBE": "XLK", "CSCO":  "XLK", "IBM":  "XLK",
+    "SNOW": "XLK", "DDOG": "XLK", "CRWD": "XLK", "NET":   "XLK", "PANW": "XLK",
+    "ZS":   "XLK", "OKTA": "XLK", "NOW":  "XLK", "WDAY":  "XLK", "VEEV": "XLK",
+    # Communication / Media / Internet
+    "NFLX": "XLK", "SNAP": "XLK", "PINS": "XLK", "RDDT":  "XLK",
+    "DIS":  "XLK", "CMCSA":"XLK", "T":    "XLK", "VZ":    "XLK", "TMUS": "XLK",
+    # Consumer Discretionary
+    "AMZN": "XLY", "TSLA": "XLY", "SHOP": "XLY", "NKE":   "XLY", "LULU": "XLY",
+    "SBUX": "XLY", "MCD":  "XLY", "YUM":  "XLY", "CMG":   "XLY", "HD":   "XLY",
+    "LOW":  "XLY", "TGT":  "XLY", "ETSY": "XLY", "UBER":  "XLY", "LYFT": "XLY",
+    "ABNB": "XLY", "DASH": "XLY", "RBLX": "XLY",
+    "F":    "XLY", "GM":   "XLY", "RIVN": "XLY", "LCID":  "XLY",
+    "NIO":  "XLY", "XPEV": "XLY", "LI":   "XLY",
+    # Financials
+    "JPM":  "XLF", "BAC":  "XLF", "C":    "XLF", "WFC":   "XLF", "GS":   "XLF",
+    "MS":   "XLF", "BLK":  "XLF", "V":    "XLF", "MA":    "XLF", "AXP":  "XLF",
+    "PYPL": "XLF", "COIN": "XLF", "SOFI": "XLF", "HOOD":  "XLF",
+    "MET":  "XLF", "PRU":  "XLF", "AFL":  "XLF",
+    # Healthcare / Biotech / Pharma
+    "JNJ":  "XLV", "PFE":  "XLV", "MRNA": "XLV", "BNTX":  "XLV", "ABBV": "XLV",
+    "UNH":  "XLV", "CVS":  "XLV", "LLY":  "XLV", "BMY":   "XLV", "MRK":  "XLV",
+    "AMGN": "XLV", "GILD": "XLV", "BIIB": "XLV", "REGN":  "XLV",
+    "ISRG": "XLV", "DHR":  "XLV", "BSX":  "XLV",
+    # Energy
+    "XOM":  "XLE", "CVX":  "XLE", "COP":  "XLE", "OXY":   "XLE",
+    "SLB":  "XLE", "HAL":  "XLE", "MPC":  "XLE", "VLO":   "XLE", "USO":  "XLE",
+    # Industrials / Aerospace / Defense
+    "BA":   "XLI", "GE":   "XLI", "CAT":  "XLI", "DE":    "XLI", "MMM":  "XLI",
+    "HON":  "XLI", "LMT":  "XLI", "RTX":  "XLI", "NOC":   "XLI", "GD":   "XLI",
+    # Consumer Staples
+    "WMT":  "XLP", "COST": "XLP",
+    # Real Estate
+    "AMT":  "XLRE", "PLD": "XLRE", "SPG":  "XLRE", "O":    "XLRE",
+    # Materials / Commodities (use XLB or GLD as proxy)
+    "GDX":  "XLB", "GDXJ":"XLB",
+    "GLD":  "XLB", "IAU":  "XLB", "SLV":  "XLB",
+    # China → FXI
+    "BABA": "FXI", "JD":   "FXI", "FXI":  "FXI",
+}
+
+
+def sector_alignment_filter(
+    direction:     str,
+    sector_regime: str,
+) -> tuple[bool, str]:
+    """
+    Only take a signal if the sector ETF trend agrees with the trade direction.
+    - BUY CALL in a bearish sector = fighting the sector → skip
+    - BUY PUT in a bullish sector = fighting the sector → skip
+    'neutral' sectors always pass.
+    """
+    if direction == "CALL" and sector_regime == "bear":
+        return False, "Sector ETF is BEARISH - skipping CALL signal"
+    if direction == "PUT" and sector_regime == "bull":
+        return False, "Sector ETF is BULLISH - skipping PUT signal"
+    return True, ""
+
+
+def compute_sector_regimes(df: pd.DataFrame) -> pd.Series:
+    """
+    For a sector ETF's price DataFrame, compute a daily regime series.
+    Returns pd.Series indexed by date with values 'bull', 'bear', 'neutral'.
+    """
+    if df is None or len(df) < 55:
+        return pd.Series(dtype=str)
+
+    close  = df["Close"].astype(float)
+    ema20  = close.ewm(span=20, adjust=False).mean()
+    ema50  = close.ewm(span=50, adjust=False).mean()
+
+    bull = (close > ema50) & (ema20 > ema50)
+    bear = (close < ema50) & (ema20 < ema50)
+
+    regime = pd.Series("neutral", index=close.index)
+    regime[bull] = "bull"
+    regime[bear] = "bear"
+    return regime
+
+
 # ── Master filter pipeline ────────────────────────────────────────────────────
 
 def apply_all_filters(
-    score:       int,
-    direction:   str,
-    sigma:       float,
-    adx_val:     float,
-    row:         pd.Series,
-    regime:      str        = "neutral",
-    weekly_close: pd.Series  = None,
+    score:          int,
+    direction:      str,
+    sigma:          float,
+    adx_val:        float,
+    row:            pd.Series,
+    regime:         str              = "neutral",
+    weekly_close:   pd.Series | None = None,
+    earnings_dates: set              = None,
+    sector_regime:  str              = "neutral",
+    ml_model                         = None,
+    entry_features: dict | None      = None,
 ) -> tuple[bool, list[str]]:
     """
-    Run all filters in sequence. Returns (should_trade, list_of_rejection_reasons).
-    Stops at first rejection.
+    Run all filters in sequence (fail-fast).
+    Returns (should_trade, list_of_rejection_reasons).
     """
+    import ml_signal
+
     checks = [
-        iv_cap_filter(sigma),          # PRIMARY: IV > 35% = negative expected return (data-proven)
-        adx_filter(adx_val),           # Skip extremely flat/ranging markets
-        regime_direction_filter(regime, direction),  # Don't fight strong macro trend
+        iv_cap_filter(sigma),
+        adx_filter(adx_val),
+        regime_direction_filter(regime, direction),
+        sector_alignment_filter(direction, sector_regime),
+        earnings_filter(
+            row.name if hasattr(row, "name") else None,
+            earnings_dates or set(),
+        ),
+        ml_signal.ml_filter(ml_model, entry_features or {}),
     ]
 
     rejections = []
